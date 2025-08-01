@@ -1,0 +1,505 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  SquarePen,
+  Trash2,
+  Plus,
+  Inbox,
+  Send,
+  BellRing,
+  Activity,
+  X,
+  Loader2,
+  CheckCircle,
+  CircleAlert
+} from 'lucide-react';
+
+// Firebase configuration from the environment
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Utility function to generate a unique ID
+const generateUniqueId = () => uuidv4();
+
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('inbox');
+  const [data, setData] = useState({});
+  const [showModal, setShowModal] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [currentRecord, setCurrentRecord] = useState(null);
+  const [formInput, setFormInput] = useState({ title: '', details: '', date: '', status: 'قيد التنفيذ' });
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [recordToDelete, setRecordToDelete] = useState(null);
+  const [error, setError] = useState('');
+  // State for showing notifications
+  const [notification, setNotification] = useState({ message: '', type: '', id: null });
+
+  // 1. Initialize Firebase and authenticate
+  useEffect(() => {
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+
+      const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+        } else {
+          // If not signed in, sign in anonymously
+          await signInAnonymously(firebaseAuth);
+        }
+        setIsAuthReady(true);
+      });
+
+      // If a custom token is available, use it for sign-in
+      if (initialAuthToken) {
+        signInWithCustomToken(firebaseAuth, initialAuthToken).catch(e => {
+          console.error("Error signing in with custom token:", e);
+          setError("فشل تسجيل الدخول. يرجى المحاولة مرة أخرى.");
+          setIsAuthReady(true);
+        });
+      }
+
+      return () => unsubscribeAuth();
+    } catch (e) {
+      console.error("Firebase initialization failed:", e);
+      setError("فشل تهيئة التطبيق. يرجى التحقق من الإعدادات.");
+    }
+  }, []);
+
+  // 2. Fetch data from Firestore using onSnapshot for real-time updates
+  useEffect(() => {
+    if (db && userId && isAuthReady) {
+      const collections = ['inbox', 'outbox', 'circulars', 'activities'];
+      const unsubscribes = collections.map(collectionName => {
+        const path = `/artifacts/${appId}/users/${userId}/${collectionName}`;
+        const q = collection(db, path);
+        return onSnapshot(q, (snapshot) => {
+          // Check for changes and trigger notifications
+          snapshot.docChanges().forEach((change) => {
+            const doc = { ...change.doc.data(), id: change.doc.id };
+            let message = '';
+            let type = 'info';
+            if (change.type === 'added') {
+              message = `تمت إضافة سجل جديد: ${doc.title}`;
+              type = 'success';
+            } else if (change.type === 'modified') {
+              message = `تم تعديل سجل: ${doc.title}`;
+              type = 'info';
+            } else if (change.type === 'removed') {
+              message = `تم حذف سجل: ${doc.title}`;
+              type = 'warning';
+            }
+            if (message) {
+              setNotification({ message, type, id: Date.now() });
+              // Removed the automatic timer, notification now persists until manually closed.
+            }
+          });
+
+          const fetchedData = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+          }));
+          setData(prevData => ({
+            ...prevData,
+            [collectionName]: fetchedData
+          }));
+          setLoading(false);
+        }, (err) => {
+          console.error("Error fetching data:", err);
+          setError("حدث خطأ أثناء جلب البيانات.");
+          setLoading(false);
+        });
+      });
+      return () => unsubscribes.forEach(unsub => unsub());
+    }
+  }, [db, userId, isAuthReady]);
+
+  // Handle CRUD Operations
+  const handleSave = async (e) => {
+    e.preventDefault();
+    if (!formInput.title || !formInput.date) {
+      // In a production app, use a custom modal here instead of alert
+      console.error("الرجاء إدخال العنوان والتاريخ.");
+      return;
+    }
+    setIsSaving(true);
+    const collectionRef = collection(db, `/artifacts/${appId}/users/${userId}/${tab}`);
+    try {
+      if (isEditing && currentRecord) {
+        const recordDocRef = doc(db, `/artifacts/${appId}/users/${userId}/${tab}`, currentRecord.id);
+        await updateDoc(recordDocRef, formInput);
+      } else {
+        await addDoc(collectionRef, { ...formInput, createdAt: new Date() });
+      }
+      setFormInput({ title: '', details: '', date: '', status: 'قيد التنفيذ' });
+      setShowModal(false);
+      setIsEditing(false);
+      setCurrentRecord(null);
+    } catch (e) {
+      console.error("Error adding/updating document: ", e);
+      setError("حدث خطأ أثناء حفظ البيانات.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!recordToDelete) return;
+    try {
+      const recordDocRef = doc(db, `/artifacts/${appId}/users/${userId}/${tab}`, recordToDelete.id);
+      await deleteDoc(recordDocRef);
+    } catch (e) {
+      console.error("Error deleting document: ", e);
+      setError("حدث خطأ أثناء حذف السجل.");
+    } finally {
+      setShowDeleteModal(false);
+      setRecordToDelete(null);
+    }
+  };
+
+  // UI Handlers
+  const openAddModal = () => {
+    setFormInput({ title: '', details: '', date: '', status: 'قيد التنفيذ' });
+    setIsEditing(false);
+    setCurrentRecord(null);
+    setShowModal(true);
+  };
+
+  const openEditModal = (record) => {
+    setFormInput({
+      title: record.title,
+      details: record.details,
+      date: record.date,
+      status: record.status || 'قيد التنفيذ'
+    });
+    setIsEditing(true);
+    setCurrentRecord(record);
+    setShowModal(true);
+  };
+
+  const openDeleteConfirmation = (record) => {
+    setRecordToDelete(record);
+    setShowDeleteModal(true);
+  };
+
+  // NEW: Function to close the notification
+  const closeNotification = () => {
+    setNotification({ message: '', type: '', id: null });
+  };
+
+  const getTabIcon = (tabName) => {
+    switch (tabName) {
+      case 'inbox': return <Inbox size={20} />;
+      case 'outbox': return <Send size={20} />;
+      case 'circulars': return <BellRing size={20} />;
+      case 'activities': return <Activity size={20} />;
+      default: return null;
+    }
+  };
+
+  const getStatusStyle = (status) => {
+    switch (status) {
+      case 'مكتمل':
+        return 'bg-green-100 text-green-800';
+      case 'قيد التنفيذ':
+        return 'bg-blue-100 text-blue-800';
+      case 'معلق':
+        return 'bg-yellow-100 text-yellow-800';
+      default:
+        return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  const getNotificationStyle = (type) => {
+    switch(type) {
+      case 'success':
+        return 'bg-green-100 text-green-800 border-green-400';
+      case 'warning':
+        return 'bg-yellow-100 text-yellow-800 border-yellow-400';
+      case 'info':
+        return 'bg-blue-100 text-blue-800 border-blue-400';
+      default:
+        return 'bg-gray-100 text-gray-800 border-gray-400';
+    }
+  };
+
+  if (!isAuthReady || loading) {
+    return (
+      <div className="flex justify-center items-center h-screen bg-gray-50">
+        <Loader2 className="h-10 w-10 animate-spin text-indigo-500" />
+        <span className="sr-only">Loading...</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-100 font-sans text-gray-800">
+      <div className="container mx-auto p-4 md:p-8">
+        <header className="text-center mb-8">
+          <h1 className="text-4xl md:text-5xl font-bold text-gray-900 leading-tight">
+            نظام إدارة سجلات محافظة ذي قار
+          </h1>
+          <p className="mt-2 text-lg text-gray-600">
+            أهلاً بك! يمكنك إدارة بياناتك من هنا.
+          </p>
+        </header>
+
+        {/* UPDATED: Notification component with a close button */}
+        {notification.message && (
+          <div
+            key={notification.id}
+            className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-full shadow-lg flex items-center justify-between space-x-4 animate-fade-in ${getNotificationStyle(notification.type)}`}
+          >
+            <div className="flex items-center space-x-2 rtl:space-x-reverse">
+              {notification.type === 'success' && <CheckCircle size={20} />}
+              {notification.type === 'info' && <CircleAlert size={20} />}
+              {notification.type === 'warning' && <CircleAlert size={20} />}
+              <span className="font-semibold">{notification.message}</span>
+            </div>
+            <button onClick={closeNotification} className="text-gray-500 hover:text-gray-900">
+              <X size={20} />
+            </button>
+          </div>
+        )}
+
+        {error && (
+          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative mb-4" role="alert">
+            <span className="block sm:inline">{error}</span>
+          </div>
+        )}
+        
+        <div className="text-center p-2 mb-4 bg-gray-200 rounded-lg shadow-sm text-sm break-all">
+          <span className="font-semibold text-gray-700">معرف المستخدم:</span> raed.1970
+          <span className="text-gray-500 ml-2">(ID: {userId})</span>
+        </div>
+
+        {/* Tab Navigation */}
+        <div className="flex flex-wrap justify-center md:space-x-4 mb-6 rtl:space-x-reverse">
+          <button
+            onClick={() => setTab('inbox')}
+            className={`flex-1 md:flex-none flex items-center justify-center space-x-2 rtl:space-x-reverse py-3 px-6 rounded-lg font-semibold transition-colors duration-200 m-1 ${tab === 'inbox' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-gray-700 hover:bg-indigo-100 hover:text-indigo-600'}`}
+          >
+            {getTabIcon('inbox')}
+            <span>البريد الوارد</span>
+          </button>
+          <button
+            onClick={() => setTab('outbox')}
+            className={`flex-1 md:flex-none flex items-center justify-center space-x-2 rtl:space-x-reverse py-3 px-6 rounded-lg font-semibold transition-colors duration-200 m-1 ${tab === 'outbox' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-gray-700 hover:bg-indigo-100 hover:text-indigo-600'}`}
+          >
+            {getTabIcon('outbox')}
+            <span>البريد الصادر</span>
+          </button>
+          <button
+            onClick={() => setTab('circulars')}
+            className={`flex-1 md:flex-none flex items-center justify-center space-x-2 rtl:space-x-reverse py-3 px-6 rounded-lg font-semibold transition-colors duration-200 m-1 ${tab === 'circulars' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-gray-700 hover:bg-indigo-100 hover:text-indigo-600'}`}
+          >
+            {getTabIcon('circulars')}
+            <span>التعميمات</span>
+          </button>
+          <button
+            onClick={() => setTab('activities')}
+            className={`flex-1 md:flex-none flex items-center justify-center space-x-2 rtl:space-x-reverse py-3 px-6 rounded-lg font-semibold transition-colors duration-200 m-1 ${tab === 'activities' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-gray-700 hover:bg-indigo-100 hover:text-indigo-600'}`}
+          >
+            {getTabIcon('activities')}
+            <span>النشاطات</span>
+          </button>
+        </div>
+
+        {/* Add Record Button */}
+        <div className="flex justify-end mb-6">
+          <button
+            onClick={openAddModal}
+            className="flex items-center space-x-2 rtl:space-x-reverse px-6 py-3 bg-green-500 text-white rounded-lg shadow-md hover:bg-green-600 transition-colors duration-200"
+          >
+            <Plus size={20} />
+            <span className="font-semibold">إضافة سجل جديد</span>
+          </button>
+        </div>
+
+        {/* Data List */}
+        <div className="bg-white rounded-xl shadow-lg p-4 md:p-6">
+          {data[tab] && data[tab].length > 0 ? (
+            <ul className="space-y-4">
+              {data[tab].map((record) => (
+                <li
+                  key={record.id}
+                  className="flex flex-col md:flex-row justify-between items-start md:items-center p-4 bg-gray-50 rounded-lg shadow-sm transition-transform transform hover:scale-[1.01]"
+                >
+                  <div className="flex-1 min-w-0">
+                    <h3 className="text-lg font-bold text-indigo-700 truncate">
+                      {record.title}
+                    </h3>
+                    {record.details && (
+                      <p className="mt-1 text-gray-600 break-words">{record.details}</p>
+                    )}
+                    <p className="mt-1 text-sm text-gray-500">
+                      التاريخ: {record.date}
+                    </p>
+                  </div>
+                  <div className="mt-4 md:mt-0 flex items-center space-x-4 rtl:space-x-reverse">
+                    {record.status && (
+                       <span className={`px-3 py-1 text-sm font-semibold rounded-full ${getStatusStyle(record.status)}`}>
+                          {record.status}
+                       </span>
+                    )}
+                    <div className="flex space-x-2 rtl:space-x-reverse">
+                      <button
+                        onClick={() => openEditModal(record)}
+                        className="p-2 bg-yellow-400 text-white rounded-full shadow-md hover:bg-yellow-500 transition-colors duration-200"
+                        title="تعديل"
+                      >
+                        <SquarePen size={20} />
+                      </button>
+                      <button
+                        onClick={() => openDeleteConfirmation(record)}
+                        className="p-2 bg-red-500 text-white rounded-full shadow-md hover:bg-red-600 transition-colors duration-200"
+                        title="حذف"
+                      >
+                        <Trash2 size={20} />
+                      </button>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-center py-10 text-gray-500">
+              <p className="text-xl">لا توجد سجلات حاليًا في هذا القسم.</p>
+              <p className="mt-2">
+                استخدم زر "إضافة سجل جديد" لإضافة أول سجل.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Modal for Add/Edit Record */}
+      {showModal && (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex justify-center items-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-lg relative transform transition-all scale-100 opacity-100">
+            <button
+              onClick={() => setShowModal(false)}
+              className="absolute top-4 left-4 p-2 text-gray-500 hover:text-gray-900 rounded-full hover:bg-gray-100"
+              title="إغلاق"
+            >
+              <X size={24} />
+            </button>
+            <h2 className="text-2xl font-bold text-gray-800 mb-6 text-center">
+              {isEditing ? 'تعديل السجل' : 'إضافة سجل جديد'}
+            </h2>
+            <form onSubmit={handleSave} className="space-y-4">
+              <div>
+                <label htmlFor="title" className="block text-sm font-medium text-gray-700">
+                  العنوان
+                </label>
+                <input
+                  type="text"
+                  id="title"
+                  value={formInput.title}
+                  onChange={(e) => setFormInput({ ...formInput, title: e.target.value })}
+                  className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
+                  placeholder="عنوان السجل"
+                  required
+                />
+              </div>
+              <div>
+                <label htmlFor="date" className="block text-sm font-medium text-gray-700">
+                  التاريخ
+                </label>
+                <input
+                  type="date"
+                  id="date"
+                  value={formInput.date}
+                  onChange={(e) => setFormInput({ ...formInput, date: e.target.value })}
+                  className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
+                  required
+                />
+              </div>
+              <div>
+                <label htmlFor="status" className="block text-sm font-medium text-gray-700">
+                  الحالة
+                </label>
+                <select
+                  id="status"
+                  value={formInput.status}
+                  onChange={(e) => setFormInput({ ...formInput, status: e.target.value })}
+                  className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
+                >
+                  <option value="قيد التنفيذ">قيد التنفيذ</option>
+                  <option value="مكتمل">مكتمل</option>
+                  <option value="معلق">معلق</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="details" className="block text-sm font-medium text-gray-700">
+                  التفاصيل (اختياري)
+                </label>
+                <textarea
+                  id="details"
+                  rows="3"
+                  value={formInput.details}
+                  onChange={(e) => setFormInput({ ...formInput, details: e.target.value })}
+                  className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
+                  placeholder="أدخل التفاصيل هنا..."
+                ></textarea>
+              </div>
+              <div className="flex justify-center pt-4">
+                <button
+                  type="submit"
+                  className="w-full sm:w-auto px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition-colors duration-200 flex items-center justify-center space-x-2 rtl:space-x-reverse disabled:bg-indigo-400"
+                  disabled={isSaving}
+                >
+                  {isSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : null}
+                  <span>{isEditing ? 'حفظ التعديل' : 'إضافة'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal for Delete Confirmation */}
+      {showDeleteModal && (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex justify-center items-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm relative">
+            <h2 className="text-xl font-bold text-gray-800 mb-4 text-center">
+              تأكيد الحذف
+            </h2>
+            <p className="text-gray-700 text-center mb-6">
+              هل أنت متأكد من أنك تريد حذف هذا السجل؟ لا يمكن التراجع عن هذا الإجراء.
+            </p>
+            <div className="flex justify-center space-x-4 rtl:space-x-reverse">
+              <button
+                onClick={() => setShowDeleteModal(false)}
+                className="px-6 py-2 bg-gray-300 text-gray-800 rounded-lg font-semibold hover:bg-gray-400 transition-colors"
+              >
+                إلغاء
+              </button>
+              <button
+                onClick={handleDelete}
+                className="px-6 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700 transition-colors"
+              >
+                حذف
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
